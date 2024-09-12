@@ -1,0 +1,33 @@
+@startuml
+
+actor User
+participant GetMemberByUsernameController
+participant GetMemberByUsername
+participant Repository
+database Database
+
+User -> GetMemberByUsernameController: Request
+activate GetMemberByUsernameController
+
+GetMemberByUsernameController -> GetMemberByUsername: execute(dto: GetMemberByUsernameDTO)
+activate GetMemberByUsername
+
+opt error
+GetMemberByUsernameController --> User: errorMessage
+end
+
+GetMemberByUsername -> Repository: getMemberByUsername(dto: GetMemberByUsernameDTO)
+activate Repository
+
+Repository -> Database: query
+activate Database
+
+Database --> Repository: return memberInfo
+
+Repository --> GetMemberByUsername: memberInfo
+
+GetMemberByUsername --> GetMemberByUsernameController: memberInfo
+
+GetMemberByUsernameController --> User: memberInfo
+
+@enduml

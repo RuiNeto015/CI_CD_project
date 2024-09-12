@@ -1,0 +1,33 @@
+@startuml
+
+actor User
+participant GetPopularPostsController
+participant GetPopularPosts
+participant Repository
+database Database
+
+User -> GetPopularPostsController: Request
+activate GetPopularPostsController
+
+GetPopularPostsController -> GetPopularPosts: execute(dto: GetPopularPostsRequestDTO)
+activate GetPopularPosts
+
+opt error
+GetPopularPostsController --> User: errorMessage
+end
+
+GetPopularPosts -> Repository: getPopularPosts(dto: GetPopularPostsRequestDTO)
+activate Repository
+
+Repository -> Database: query
+activate Database
+
+Database --> Repository: return postsList
+
+Repository --> GetPopularPosts: postsList
+
+GetPopularPosts --> GetPopularPostsController: postsList
+
+GetPopularPostsController --> User: postsList
+
+@enduml

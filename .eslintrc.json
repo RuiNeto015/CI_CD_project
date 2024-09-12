@@ -1,0 +1,38 @@
+{
+  "env": {
+    "browser": true
+  },
+  "parser": "@typescript-eslint/parser",
+  "parserOptions": {
+    "ecmaFeatures": {
+      "jsx": true
+    },
+    "ecmaVersion": 12
+  },
+  "plugins": [
+    "react",
+    "@typescript-eslint"
+  ],
+  "rules": {
+    "capitalized-comments": [
+      "error",
+      "always",
+      {
+        "ignoreConsecutiveComments": true
+      }
+    ],
+    "eqeqeq": [
+      "error",
+      "smart"
+    ],
+    "max-classes-per-file": [
+      "error",
+      10
+    ],
+    "getter-return": "error",
+    "for-direction": "error",
+    "no-duplicate-imports": "error",
+    "no-self-compare": "error",
+    "no-empty": "error"
+  }
+}

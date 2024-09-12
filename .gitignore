@@ -1,0 +1,19 @@
+/node_modules
+/*.env
+npm-debug.log
+.DS_Store
+/templates
+# Local Netlify folder
+.netlify
+/dist
+/coverage
+report.html
+
+.idea
+.vscode
+/test_artifacts/
+/code_quality_artifacts/
+/integration_tests_artifacts/
+/unit_tests_artifacts/
+/tsdocs/
+/swagger_docs/

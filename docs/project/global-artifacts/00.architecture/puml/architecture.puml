@@ -1,0 +1,29 @@
+@startuml
+
+node DeploymentMachine <<device>> {
+    node MySQL <<container>>
+
+    node Adminer <<container>>
+
+    node Redis <<container>>
+
+    node Backend <<node process>>
+
+    node Frontend <<node process>>
+
+    Frontend -- "5001" Backend: http
+
+    Backend -- "3306" MySQL: tcp/ip
+
+    Backend -- "6379" Redis: tcp/ip
+
+    Adminer -- "3306" MySQL: tcp/ip
+
+    node Browser <<process>>
+
+    Browser -left- "3000" Frontend: http
+
+    Browser -- "8080" Adminer: http
+}
+
+@enduml

@@ -1,0 +1,8 @@
+{
+    "migrate": "true",
+    "driver": "com.mysql.jdbc.Driver",
+    "user": "tonysoprano",
+    "password": "12345678",
+    "baselineOnMigrate": "true",
+    "db_name": "data_prod"
+}

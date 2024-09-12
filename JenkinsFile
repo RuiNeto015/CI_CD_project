@@ -1,0 +1,456 @@
+#!/usr/bin/env groovy
+
+import java.text.SimpleDateFormat
+import groovy.transform.Field
+
+@Field
+def branch
+
+@Field
+def blue_green_state = [currentProd: "", newProd: ""]
+
+@Field
+def rollback = [action: "", rollback_migration_v: "", image: ""]
+
+@Field
+def submission_zip_name = "2023-2024-MEI-ODSOFT-T016.zip"
+
+def execute_command(String command) {
+    if (isUnix()) {
+        sh "$command"
+    } else {
+        bat "$command"
+    }
+}
+
+def copy_env() {
+    if (isUnix()) {
+        execute_command("cp .env.template .env")
+    } else {
+        execute_command("copy .env.template .env")
+    }
+}
+
+def command_script_status(String command) {
+    if (isUnix()) {
+        return sh(script: "$command", returnStatus: true)
+    } else {
+        return bat(script: "$command", returnStatus: true)
+    }
+}
+
+def command_script_stdout(String command) {
+    if (isUnix()) {
+        return sh(script: "$command", returnStdout: true)
+    } else {
+        return bat(script: "$command", returnStdout: true)
+    }
+}
+
+def load_execution_properties(String payload) {
+    def payloadObj = readJSON text: payload
+
+    if ((payloadObj.action != "closed" && payloadObj.action != "opened" && payloadObj.action != "rollback") || (payloadObj.containsKey("pull_request") && payloadObj.pull_request.user.type == "Bot")) {
+        // handles github hooks that aren't supposed to trigger pipeline (pull_request.assgined, pull_request.labeled, etc.)
+        branch = "null"
+
+    } else if (payloadObj.action == "closed" && payloadObj.pull_request.merged == true) {
+        // pipeline runs for a branch that has recently received new contributions
+        branch = payloadObj.pull_request.base.ref
+
+    } else if (payloadObj.action == "opened") {
+        // pipeline runs for a branch that wants to be merged
+        branch = payloadObj.pull_request.head.ref
+
+    } else {
+        branch = "master"
+        rollback.action = payloadObj.action
+        rollback.rollback_migration_v = payloadObj.rollback_migration_v
+        rollback.image = payloadObj.image
+    }
+}
+
+def publish_tag(String message) {
+    if (branch != "null" && rollback.action != "rollback") {
+        execute_command("git tag $message && git push origin $message")
+    }
+}
+
+def find_which_prod_is_running() {
+    if (container_exists("prod_1") && is_container_running("prod_1")) {
+        // container with name 'prod1' is running
+        blue_green_state.currentProd = "prod_1"
+        blue_green_state.newProd = "prod_2"
+    } else {
+        // container with name 'prod2' is running
+        blue_green_state.currentProd = "prod_2"
+        blue_green_state.newProd = "prod_1"
+    }
+}
+
+def container_exists(String container) {
+    return command_script_status("@docker container inspect $container") == 0
+}
+
+def is_container_running(String container) {
+    def output_json = command_script_stdout("@docker container inspect $container").trim()
+    def output_object = readJSON text: output_json
+    return output_object[0]["State"]["Running"]
+}
+
+def create_new_db(new_db_container, current_db_container) {
+    stop_and_remove_container(new_db_container) // stop and remove container if has the same name
+
+    //check if a volume with the same name already exists
+    if (command_script_status("@docker volume inspect v_$new_db_container") == 0) {
+        execute_command("docker volume rm v_$new_db_container")
+    }
+
+    //put db in read mode
+    execute_command(""" 
+    docker exec -i $current_db_container mysql -uroot -prootpwd -e "FLUSH TABLES WITH READ LOCK; SET GLOBAL read_only = 1;"
+    """)
+    // clone mysql volume
+    execute_command("""
+    docker run --rm --volumes-from $current_db_container -v v_$new_db_container:/target alpine sh -c "cp -rp /var/lib/mysql/. /target"
+    """)
+    //start new db container with cloned volume
+    execute_command("docker run -d --name $new_db_container --volume v_$new_db_container:/var/lib/mysql --network ddd_forum_network mysql:5.6.48")
+}
+
+def get_flyway_schema_version() {
+    def output_json = command_script_stdout("@docker run --rm --network ddd_forum_network -v $WORKSPACE/flyway/conf:/flyway/conf redgate/flyway:10.2 info -outputType=json").trim()
+    def output_object = readJSON text: output_json
+    return output_object.schemaVersion
+}
+
+def db_migrations(String database) {
+    def migrate_conf = readFile('flyway/migrate-conf.json').trim()
+    def migrate_conf_obj = readJSON text: migrate_conf
+
+    if (rollback.action == "rollback" && rollback.rollback_migration_v != "") {
+        execute_command("python ./pipeline_scripts/flyway_conf_handler.py $database")
+        def flyway_v = get_flyway_schema_version()
+        execute_command("python ./pipeline_scripts/migration_version_handler.py $rollback.rollback_migration_v $flyway_v rollback")
+        execute_command("docker run --rm --network ddd_forum_network -v $WORKSPACE/flyway/migrations/tmp:/flyway/sql -v $WORKSPACE/flyway/conf:/flyway/conf redgate/flyway:10.2 migrate")
+    } else if (migrate_conf_obj.migrate == "true") {
+        execute_command("python ./pipeline_scripts/flyway_conf_handler.py $database")
+        def flyway_v = get_flyway_schema_version()
+        execute_command("python ./pipeline_scripts/migration_version_handler.py null $flyway_v forward")
+        execute_command("docker run --rm --network ddd_forum_network -v $WORKSPACE/flyway/migrations/tmp:/flyway/sql -v $WORKSPACE/flyway/conf:/flyway/conf redgate/flyway:10.2 migrate")
+    }
+}
+
+def handle_new_prod_db() {
+    def new_db_container = "ddd_forum_mysql_$blue_green_state.newProd"
+    def current_db_container = "ddd_forum_mysql_$blue_green_state.currentProd"
+
+    create_new_db(new_db_container, current_db_container)
+    sleep time: 10, unit: 'SECONDS'
+    db_migrations(new_db_container)
+}
+
+def handle_new_prod_app() {
+    def new_db_container = "ddd_forum_mysql_$blue_green_state.newProd"
+    def image = ""
+
+    if(rollback.action == "rollback") {
+        image = rollback.image
+    } else {
+        image = "latest"
+    }
+
+    stop_and_remove_container(blue_green_state.newProd) // stop and remove container if has the same name
+    execute_command("docker run -d --name $blue_green_state.newProd --network ddd_forum_network simaosantos1230212/ddd_forum:$image $new_db_container prod")
+    sleep time: 10, unit: 'SECONDS'
+}
+
+def stop_and_remove_container(String container) {
+    if (container_exists(container) && is_container_running(container)) {
+        execute_command("docker stop $container")
+        execute_command("docker rm $container")
+    } else if (container_exists(container)) {
+        execute_command("docker rm $container")
+    }
+}
+
+def publish_html(String reportDir, String reportFiles, String reportName) {
+    publishHTML(target: [allowMissing         : false,
+                         alwaysLinkToLastBuild: true,
+                         keepAll              : false,
+                         reportDir            : reportDir,
+                         reportFiles          : reportFiles,
+                         reportName           : reportName])
+}
+
+pipeline {
+    agent any
+
+    triggers {
+        GenericTrigger(
+                genericVariables: [
+                        [key: 'PAYLOAD', value: '$', expressionType: 'JSONPath']
+                ]
+        )
+    }
+
+    environment {
+        DOCKERHUB_CREDENTIALS = credentials('dockerhub')
+        BUILD_TIMESTAMP = new SimpleDateFormat("yyyy-MM-dd_HH'h'mm").format(new Date())
+        BUILD = "${env.BUILD_ID}_${BUILD_TIMESTAMP}"
+    }
+
+    stages {
+        stage('Load Execution Properties') {
+            steps {
+                load_execution_properties(env.PAYLOAD)
+            }
+        }
+        stage('Checkout') {
+            when {
+                expression { branch != "null" && rollback.action != "rollback" }
+            }
+            steps {
+                echo "Checking out branch $branch"
+                checkout scmGit(
+                        branches: [[name: "$branch"]],
+                        extensions: [],
+                        userRemoteConfigs: [
+                                [credentialsId: "odsoft_ssh_key",
+                                 url          : 'git@github.com:Departamento-de-Engenharia-Informatica/2023-2024-odsoft-project-assignment-2023-2024-mei-odsoft-g016.git']
+                        ])
+            }
+        }
+        stage('Build') {
+            when {
+                expression { branch != "null" && rollback.action != "rollback" }
+            }
+            steps {
+                copy_env()
+
+                echo 'Installing...'
+                execute_command('npm install')
+
+                echo 'Building...'
+                execute_command('npm run build')
+
+                echo 'Archiving "binaries"...'
+                archiveArtifacts 'dist/**'
+            }
+        }
+        stage("Code Quality and Unit Tests"){
+            when {
+                expression { branch != "null" && rollback.action != "rollback" }
+            }
+            parallel {
+                stage('Code Quality Analysis') {
+                    steps {
+                        echo 'Checking Code Quality...'
+                        execute_command('npm run check:code')
+                    }
+                    post {
+                        success {
+                            publish_html('code_quality_artifacts/', 'eslint_report.html', 'Code Quality Report')
+                            echo 'Code Quality Analyses succeeded!'
+                        }
+                        failure {
+                            publish_html('code_quality_artifacts/', 'eslint_report.html', 'Code Quality Report')
+                            echo 'Code Quality Analyses failed!'
+                        }
+                    }
+                }
+                stage('Unit Tests') {
+                    steps {
+                        echo 'Running Unit tests...'
+                        execute_command('npm run test:unit')
+                    }
+                    post {
+                        success {
+                            publish_html('unit_tests_artifacts/', 'test_report.html', 'Unit Tests Report')
+                            publish_html('unit_tests_artifacts/coverage', 'index.html', 'Unit Tests Coverage Report')
+                            echo 'Unit Tests succeeded!'
+                        }
+                        failure {
+                            publish_html('unit_tests_artifacts/', 'test_report.html', 'Unit Tests Report')
+                            publish_html('unit_tests_artifacts/coverage', 'index.html', 'Unit Tests Coverage Report')
+                            echo 'Unit Tests failed!'
+                        }
+                    }
+                }
+            }
+        }
+        stage('Integration Tests') {
+            when {
+                expression { branch != "null" && rollback.action != "rollback" }
+            }
+            steps {
+                echo 'Running Integration tests...'
+                execute_command('docker compose -f docker-compose-integration.yml up -d')
+                execute_command("docker build . -t simaosantos1230212/ddd_forum:$BUILD --no-cache")
+                execute_command("docker run -d --name ddd_forum_app --network ddd_forum_network_integration simaosantos1230212/ddd_forum:$BUILD")
+                sleep time: 30, unit: 'SECONDS'
+                execute_command('docker exec -i ddd_forum_app npm run test:api')
+            }
+            post {
+                success {
+                    execute_command("""
+                    docker cp "ddd_forum_app:/usr/src/ddd/integration_tests_artifacts" .
+                    """)
+                    publish_html('integration_tests_artifacts/', 'test_report.html', 'Integration Tests Report')
+                    publish_html('integration_tests_artifacts/coverage', 'index.html', 'Integration Tests Coverage Report')
+                    stop_and_remove_container("ddd_forum_app")
+                    execute_command('docker compose -f docker-compose-integration.yml down')
+                    echo 'Integration tests succeeded!'
+                }
+                failure {
+                    execute_command("""
+                    docker cp "ddd_forum_app:/usr/src/ddd/integration_tests_artifacts" .
+                    """)
+                    publish_html('integration_tests_artifacts/', 'test_report.html', 'Integration Tests Report')
+                    publish_html('integration_tests_artifacts/coverage', 'index.html', 'Integration Tests Coverage Report')
+                    stop_and_remove_container("ddd_forum_app")
+                    execute_command('docker compose -f docker-compose-integration.yml down')
+                    echo 'Integration tests failed!'
+                }
+            }
+        }
+        stage('Documentation') {
+            when {
+                expression { branch != "null" && rollback.action != "rollback" }
+            }
+            parallel {
+                stage('Generate tsdocs') {
+                    steps {
+                        echo 'Generating tsdocs...'
+                        execute_command('npm run docs:tsdocs')
+                        echo 'Archiving tsdocs...'
+                        archiveArtifacts 'tsdocs/**'
+                        publish_html('tsdocs/', 'index.html', 'TSDocs Report')
+                    }
+                }
+                stage('Generate swagger') {
+                    steps {
+                        echo 'Generating swagger...'
+                        execute_command('npm run docs:swagger')
+
+                        echo 'Archiving swagger...'
+                        archiveArtifacts 'swagger_docs/**'
+                    }
+                }
+            }
+        }
+        stage('Generate pdf') {
+            when {
+                expression { branch != "null" && rollback.action != "rollback" }
+            }
+            steps {
+                echo 'Generating pdf..'
+                execute_command('npm run generate:pdf')
+                archiveArtifacts 'README.pdf'
+            }
+        }
+        stage('Generate zip') {
+            when {
+                expression { branch != "null" && rollback.action != "rollback" }
+            }
+            steps {
+                echo 'Generating zip..'
+                execute_command('npm run generate:submission-zip')
+                archiveArtifacts "$submission_zip_name"
+            }
+        }
+        stage('Commit submission artifact') {
+            when {
+                expression { branch != "null" && rollback.action != "rollback" }
+            }
+            steps {
+                execute_command("git checkout $branch")
+                execute_command("git add $submission_zip_name")
+                execute_command("git commit $submission_zip_name -m \"#110 zip submission artifact - BUILD $BUILD\" ")
+                execute_command("git push origin $branch")
+            }
+        }
+        stage('Deployment') {
+            when {
+                expression { branch == "master" }
+            }
+            stages {
+                stage("Push docker image and find out production state") {
+                    parallel {
+                        stage("Push docker image") {
+                            when {
+                                expression { rollback.action != "rollback" }
+                            }
+                            steps {
+                                execute_command("docker tag simaosantos1230212/ddd_forum:$BUILD simaosantos1230212/ddd_forum:latest")
+                                withCredentials([usernamePassword(credentialsId: "dockerhub", passwordVariable: 'PASSWORD', usernameVariable: 'USER')]) {
+                                    execute_command("echo $PASSWORD| docker login --username $USER --password-stdin")
+                                    execute_command("docker push simaosantos1230212/ddd_forum:$BUILD")
+                                    execute_command("docker push simaosantos1230212/ddd_forum:latest")
+                                }
+                            }
+                        }
+                        stage("Find out production state") {
+                            steps {
+                                find_which_prod_is_running()
+                            }
+                        }
+                    }
+                }
+                stage("Start new containers") {
+                    parallel {
+                        stage('Start new app container') {
+                            steps {
+                                handle_new_prod_app()
+                            }
+                        }
+                        stage('Start new db container') {
+                            steps {
+                                handle_new_prod_db()
+                            }
+                        }
+                    }
+                }
+                stage("Smoke tests and redirect traffic with nginx") {
+                    steps {
+                        execute_command("docker exec -i $blue_green_state.newProd npm run test:smoke")
+                        execute_command("docker exec -d reverse_proxy sh /etc/nginx/switch_deploy.sh $blue_green_state.newProd")
+                    }
+                }
+                stage("Shutdown old containers") {
+                    parallel {
+                        stage('Shutdown old app container') {
+                            steps {
+                                stop_and_remove_container(blue_green_state.currentProd)
+                            }
+                        }
+                        stage('Shutdown old db container') {
+                            steps {
+                                stop_and_remove_container("ddd_forum_mysql_$blue_green_state.currentProd")
+                            }
+                        }
+                    }
+                }
+            }
+            post {
+                failure {
+                    //put db back in read-write
+                    execute_command(""" 
+                    docker exec -i ddd_forum_mysql_$blue_green_state.currentProd mysql -uroot -prootpwd -e "SET GLOBAL read_only = 0; UNLOCK TABLES;"
+                    """)
+                    stop_and_remove_container(blue_green_state.newProd)
+                    stop_and_remove_container("ddd_forum_mysql_$blue_green_state.newProd")
+                }
+            }
+        }
+    }
+    post {
+        success {
+            publish_tag("Build#$BUILD-Passed")
+        }
+
+        failure {
+            publish_tag("Build#$BUILD-Failed")
+        }
+    }
+}

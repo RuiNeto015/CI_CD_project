@@ -1,0 +1,9 @@
+{
+  "tsconfig": "tsconfig.json",
+  "out": "./tsdocs",
+  "exclude": [
+    "**/*+(index|.spec|.e2e).ts"
+  ],
+  "name": "ODSOFT - Practical Assignment",
+  "theme": "default"
+}

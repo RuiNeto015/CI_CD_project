@@ -1,0 +1,26 @@
+version: "3.5"
+
+services:
+  mysql:
+    container_name: ddd_forum_mysql
+    image: mysql:5.6.48
+    networks:
+      - ddd_forum_network_integration
+    environment:
+      - MYSQL_ROOT_PASSWORD=rootpwd
+      - MYSQL_DATABASE=${DDD_FORUM_DB_DEV_DB_NAME}
+      - MYSQL_USER=${DDD_FORUM_DB_USER}
+      - MYSQL_PASSWORD=${DDD_FORUM_DB_PASS}
+    restart: always
+
+  redis:
+    container_name: ddd_forum_redis
+    image: redis:latest
+    networks:
+      - ddd_forum_network_integration
+    restart: always
+
+networks:
+  ddd_forum_network_integration:
+    name: ddd_forum_network_integration
+    driver: bridge

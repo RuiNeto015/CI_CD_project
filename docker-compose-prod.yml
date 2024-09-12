@@ -1,0 +1,75 @@
+version: "3.5"
+services:
+  prod_1:
+    container_name: prod_1
+    image: simaosantos1230212/ddd_forum:profile
+    networks:
+      - ddd_forum_network
+    command: ["ddd_forum_mysql_prod_1", "prod"]
+
+  reverse_proxy:
+    container_name: reverse_proxy
+    image: nginx_reverse_proxy
+    build:
+      context: ./nginx
+    networks:
+      - ddd_forum_network
+    ports:
+      - 3000:80
+      - 5001:81
+    restart: always
+
+  ddd_forum_mysql_prod_1:
+    image: mysql:5.6.48
+    container_name: ddd_forum_mysql_prod_1
+    networks:
+      - ddd_forum_network
+    ports:
+      - "3306:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=rootpwd
+      - MYSQL_DATABASE=${DDD_FORUM_DB_PROD_DB_NAME}
+      - MYSQL_USER=${DDD_FORUM_DB_USER}
+      - MYSQL_PASSWORD=${DDD_FORUM_DB_PASS}
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: always
+
+  ddd_forum_redis:
+    image: redis:6.0.15
+    container_name: ddd_forum_redis_prod
+    networks:
+      - ddd_forum_network
+    ports:
+      - "6379:6379"
+    restart: always
+
+  dbgate:
+    image: dbgate/dbgate
+    container_name: ddd_forum_dbgate_prod
+    restart: always
+    networks:
+      - ddd_forum_network
+    ports:
+      - 9000:3000
+    volumes:
+      - dbgate-data:/root/.dbgate
+    environment:
+      CONNECTIONS: con1
+
+      LABEL_con1: MySql
+      SERVER_con1: reverse_proxy
+      USER_con1: ${DDD_FORUM_DB_USER}
+      PASSWORD_con1: ${DDD_FORUM_DB_PASS}
+      PORT_con1: 82
+      DATABASE_con1: ${DDD_FORUM_DB_PROD_DB_NAME}
+      ENGINE_con1: mysql@dbgate-plugin-mysql
+
+networks:
+  ddd_forum_network:
+    name: ddd_forum_network
+    driver: bridge
+
+volumes:
+  dbgate-data:
+    driver: local
